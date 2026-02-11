@@ -1,10 +1,16 @@
-const STAGES = ['Novo lead', 'Qualificação', 'Simulação', 'Negociação', 'Fechado', 'Perdido'];
+﻿const STAGES = ['Leads do site', 'Novo lead', 'Qualificação', 'Simulação', 'Negociação', 'Fechado', 'Perdido'];
 let leads = JSON.parse(localStorage.getItem('sov_crm_data')) || [];
 let currentView = 'kanban';
 let filterText = '';
 let salesChart = null;
 let currentChartType = localStorage.getItem('sov_chart_type') || 'bar';
 let dashboardOwnerFilter = localStorage.getItem('sov_dash_owner') || 'all';
+const KANBAN_GENERAL_TAB = '__geral__';
+const KANBAN_INITIAL_VISIBLE = 4;
+const KANBAN_VISIBLE_STEP = 4;
+const KANBAN_STAGE_TABS = ['Leads do site', 'Novo lead', 'Qualificação', 'Simulação', 'Negociação', 'Fechado', 'Perdido'].filter((s) => STAGES.includes(s));
+let kanbanActiveTab = KANBAN_GENERAL_TAB;
+let kanbanVisibleByStage = {};
 
 // --- Sessão (front-end) ---
 const SESSION_TTL_MS = 8 * 60 * 60 * 1000; // 8 horas
@@ -237,13 +243,13 @@ function normalizeImportedLeads(payload) {
         const name = sanitizeString(raw.name, 120);
         if (!name) continue;
 
-        const stage = STAGES.includes(raw.stage) ? raw.stage : 'Novo lead';
+        const stage = mapImportedStage(raw.stage) || 'Novo lead';
 
         const tasksRaw = Array.isArray(raw.tasks) ? raw.tasks : [];
         const tasks = tasksRaw
             .filter(t => t && typeof t === 'object')
             .slice(0, 200)
-            .map(t => ({ desc: sanitizeString(t.desc, 160), done: !!t.done }))
+            .map(t => ({ desc: sanitizeString(t.desc, 160), done: !!t.done, createdAt: parseDateValue(t.createdAt) }))
             .filter(t => t.desc);
 
         const tagsRaw = Array.isArray(raw.tags)
@@ -254,15 +260,15 @@ function normalizeImportedLeads(payload) {
         )).slice(0, 20);
 
         const now = Date.now();
-        const createdAt = coerceEpochMs(raw.createdAt) ?? now;
-        const updatedAt = coerceEpochMs(raw.updatedAt) ?? createdAt;
+        const createdAt = parseDateValue(raw.createdAt) ?? now;
+        const updatedAt = parseDateValue(raw.updatedAt) ?? createdAt;
 
-        normalized.push({
+        const normalizedLead = {
             id,
             name,
             phone: sanitizePhone(raw.phone, 30),
             origin: sanitizeString(raw.origin, 60) || 'Geral',
-            value: Number(raw.value) || 0,
+            value: parseCurrencyValue(raw.value),
             nextStep: sanitizeString(raw.nextStep, 160),
             stage,
             tasks,
@@ -272,7 +278,13 @@ function normalizeImportedLeads(payload) {
             tags,
             createdAt,
             updatedAt
-        });
+        };
+
+        if (raw.__importMeta && typeof raw.__importMeta === 'object') {
+            normalizedLead.__importMeta = raw.__importMeta;
+        }
+
+        normalized.push(normalizedLead);
     }
 
     return { ok: true, leads: normalized };
@@ -305,7 +317,7 @@ function exportDataJson() {
 function ensureXlsxLoaded() {
     // Provided by /vendor/xlsx.full.min.js
     if (typeof window === 'undefined' || !window.XLSX) {
-        alert('Excel indisponÃ­vel: a biblioteca nÃ£o carregou. Recarregue a pÃ¡gina e tente novamente.');
+        alert('Excel indisponível: a biblioteca não carregou. Recarregue a página e tente novamente.');
         return false;
     }
     return true;
@@ -316,8 +328,17 @@ function toIsoOrEmpty(value) {
     return ms ? new Date(ms).toISOString() : '';
 }
 
+function normalizeComparableText(value) {
+    return String(value ?? '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+}
+
 function normalizeHeaderKey(key) {
-    return String(key ?? '').trim().toLowerCase();
+    return normalizeComparableText(key);
 }
 
 function pickRowValue(row, keys) {
@@ -333,6 +354,111 @@ function pickRowValue(row, keys) {
         const v = normalized[normalizeHeaderKey(k)];
         if (v !== undefined && v !== null && String(v).trim() !== '') return v;
     }
+    return '';
+}
+
+function parseCurrencyValue(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    const raw = String(value ?? '').trim();
+    if (!raw) return 0;
+
+    let cleaned = raw
+        .replace(/\s+/g, '')
+        .replace(/r\$/ig, '')
+        .replace(/[^\d,.\-]/g, '');
+    if (!cleaned) return 0;
+
+    const commaCount = (cleaned.match(/,/g) || []).length;
+    const dotCount = (cleaned.match(/\./g) || []).length;
+    if (commaCount > 0 && dotCount > 0) {
+        cleaned = cleaned.replace(/\./g, '').replace(',', '.');
+    } else if (commaCount > 0) {
+        cleaned = cleaned.replace(',', '.');
+    }
+
+    const parsed = Number(cleaned);
+    return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function excelSerialToEpochMs(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value)) return null;
+    if (value > 100000000000) return value;
+    if (value > 1000000000 && value < 9999999999) return value * 1000;
+    if (value >= 20000 && value <= 90000) {
+        const msPerDay = 24 * 60 * 60 * 1000;
+        const excelEpoch = Date.UTC(1899, 11, 30);
+        return Math.round(excelEpoch + (value * msPerDay));
+    }
+    return null;
+}
+
+function parseDateValue(value) {
+    if (value === null || value === undefined || value === '') return null;
+
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        const fromExcel = excelSerialToEpochMs(value);
+        if (fromExcel) return fromExcel;
+        return coerceEpochMs(value);
+    }
+
+    const str = String(value).trim();
+    if (!str) return null;
+
+    const asNum = Number(str);
+    if (Number.isFinite(asNum)) {
+        const fromExcel = excelSerialToEpochMs(asNum);
+        if (fromExcel) return fromExcel;
+    }
+
+    const ptBr = str.match(/^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{2,4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?$/);
+    if (ptBr) {
+        const day = Number(ptBr[1]);
+        const month = Number(ptBr[2]);
+        const rawYear = Number(ptBr[3]);
+        const year = rawYear < 100 ? (2000 + rawYear) : rawYear;
+        const hour = Number(ptBr[4] || 0);
+        const minute = Number(ptBr[5] || 0);
+        const second = Number(ptBr[6] || 0);
+        const dt = new Date(year, month - 1, day, hour, minute, second);
+        const ms = dt.getTime();
+        if (Number.isFinite(ms)) return ms;
+    }
+
+    return coerceEpochMs(str);
+}
+
+function formatDateForField(value) {
+    const ms = parseDateValue(value);
+    if (!ms) return sanitizeString(value, 160);
+    return new Date(ms).toLocaleString('pt-BR');
+}
+
+function statusIndicatesLost(value) {
+    const s = normalizeComparableText(value);
+    if (!s) return false;
+    return (
+        s.includes('nao quer') ||
+        s.includes('sem interesse') ||
+        s.includes('desinteressado') ||
+        s.includes('desinteressada') ||
+        s.includes('desinteresse')
+    );
+}
+
+function mapImportedStage(value) {
+    const raw = sanitizeString(value, 80);
+    if (!raw) return '';
+    if (STAGES.includes(raw)) return raw;
+
+    const s = normalizeComparableText(raw);
+    if (!s) return '';
+    if (statusIndicatesLost(s) || s.includes('perdido')) return 'Perdido';
+    if (s.includes('fechado') || s.includes('ganho') || s.includes('venda')) return 'Fechado';
+    if (s.includes('negoci')) return 'Negociação';
+    if (s.includes('simula')) return 'Simulação';
+    if (s.includes('qualifica')) return 'Qualificação';
+    if (s.includes('site')) return 'Leads do site';
+    if (s.includes('novo')) return 'Novo lead';
     return '';
 }
 
@@ -374,7 +500,8 @@ function exportDataXlsx() {
                 leadId: l.id ?? '',
                 leadName: l.name ?? '',
                 desc: t && t.desc ? t.desc : '',
-                done: !!(t && t.done)
+                done: !!(t && t.done),
+                createdAt: toIsoOrEmpty(t && t.createdAt)
             });
         }
     }
@@ -402,7 +529,7 @@ async function importDataXlsx(file) {
     try {
         wb = window.XLSX.read(buf, { type: 'array' });
     } catch {
-        alert('Arquivo invÃ¡lido: nÃ£o foi possÃ­vel ler o Excel.');
+        alert('Arquivo invalido: nao foi possivel ler o Excel.');
         return;
     }
 
@@ -432,34 +559,62 @@ async function importDataXlsx(file) {
     const tasksByLeadId = new Map();
     for (const row of (Array.isArray(tasksRows) ? tasksRows : [])) {
         const leadId = pickRowValue(row, ['leadId', 'lead_id', 'id', 'lead']);
-        const desc = pickRowValue(row, ['desc', 'descricao', 'descriÃ§Ã£o', 'tarefa', 'task']);
-        const done = parseBoolish(pickRowValue(row, ['done', 'feito', 'concluida', 'concluÃ­da', 'ok']));
+        const desc = pickRowValue(row, ['desc', 'descricao', 'descricao', 'tarefa', 'task']);
+        const done = parseBoolish(pickRowValue(row, ['done', 'feito', 'concluida', 'concluida', 'ok']));
         if (!leadId || !desc) continue;
         const key = String(leadId).trim();
         if (!tasksByLeadId.has(key)) tasksByLeadId.set(key, []);
-        tasksByLeadId.get(key).push({ desc: String(desc), done });
+        const createdAt = pickRowValue(row, ['createdAt', 'created_at', 'data', 'date', 'criadoem', 'criado em']);
+        tasksByLeadId.get(key).push({ desc: String(desc), done, createdAt });
     }
 
     const rawLeads = [];
     for (const row of (Array.isArray(leadsRows) ? leadsRows : [])) {
         const id = pickRowValue(row, ['id', 'leadId', 'lead_id']);
-        const name = pickRowValue(row, ['name', 'nome']);
-        const phone = pickRowValue(row, ['phone', 'telefone', 'celular', 'numero', 'número', 'whatsapp', 'zap']);
-        const origin = pickRowValue(row, ['origin', 'origem']);
-        const stage = pickRowValue(row, ['stage', 'etapa', 'status']);
-        const value = pickRowValue(row, ['value', 'valor']);
-        const nextStep = pickRowValue(row, ['nextStep', 'next_step', 'prÃ³ximo passo', 'proximo passo']);
-        const tags = pickRowValue(row, ['tags', 'tag']);
-        const obs = pickRowValue(row, ['obs', 'observaÃ§Ãµes', 'observacoes', 'nota', 'notas']);
+        const name = pickRowValue(row, ['name', 'nome', 'nome do cliente', 'cliente']);
+        const phone = pickRowValue(row, ['phone', 'telefone', 'celular', 'numero', 'numero de contato', 'contato', 'whatsapp', 'zap']);
+        const owner = pickRowValue(row, ['owner', 'responsavel', 'consultor', 'nome do consultor']);
+        const origin = pickRowValue(row, ['origin', 'origem', 'lead', 'leads']);
+        const stageRaw = pickRowValue(row, ['stage', 'etapa']);
+        const statusRaw = pickRowValue(row, ['status', 'status do cliente', 'status cliente']);
+        const valueRaw = pickRowValue(row, ['value', 'valor', 'valor do consorcio']);
+        const nextStepRaw = pickRowValue(row, ['nextStep', 'next_step', 'proximo passo', 'passo seguinte']);
+        const returnDateRaw = pickRowValue(row, ['data de retorno', 'retorno', 'data retorno']);
+        const scheduleRaw = pickRowValue(row, ['agendamento']);
+        const tags = pickRowValue(row, ['tags', 'tag', 'consorcio de interesse', 'consorcio de interrese', 'interesse']);
+        const obs = pickRowValue(row, ['obs', 'observacoes', 'nota', 'notas']);
         const email = pickRowValue(row, ['email', 'e-mail', 'gmail']);
         const lossReason = pickRowValue(row, ['lossReason', 'loss_reason', 'motivo perda', 'motivo de perda']);
-        const owner = pickRowValue(row, ['owner', 'responsÃ¡vel', 'responsavel']);
-        const createdAt = pickRowValue(row, ['createdAt', 'created_at', 'criadoem', 'criado em']);
+        const createdAt = pickRowValue(row, ['createdAt', 'created_at', 'criadoem', 'criado em', 'carimbo de data/hora', 'carimbo de data hora', 'data do atendimento', 'data atendimento']);
         const updatedAt = pickRowValue(row, ['updatedAt', 'updated_at', 'atualizadoem', 'atualizado em']);
 
-        const obsWithEmail = email
-            ? (obs ? `${obs}\nEmail: ${email}` : `Email: ${email}`)
-            : obs;
+        const nextStepDate = returnDateRaw || scheduleRaw;
+        const nextStep = sanitizeString(nextStepRaw || (nextStepDate ? formatDateForField(nextStepDate) : ''), 160);
+
+        let stage = mapImportedStage(stageRaw) || mapImportedStage(statusRaw);
+        if (!stage && statusIndicatesLost(statusRaw)) stage = 'Perdido';
+
+        const obsParts = [];
+        if (obs) obsParts.push(String(obs));
+        if (email) obsParts.push(`Email: ${email}`);
+        if (returnDateRaw) obsParts.push(`Data de Retorno: ${formatDateForField(returnDateRaw)}`);
+        if (scheduleRaw) obsParts.push(`Agendamento: ${formatDateForField(scheduleRaw)}`);
+        const obsWithExtras = obsParts.join('\n').trim();
+
+        const provided = {};
+        if (id !== '' && id !== null && id !== undefined) provided.id = true;
+        if (name !== '' && name !== null && name !== undefined) provided.name = true;
+        if (phone !== '' && phone !== null && phone !== undefined) provided.phone = true;
+        if (owner !== '' && owner !== null && owner !== undefined) provided.owner = true;
+        if (origin !== '' && origin !== null && origin !== undefined) provided.origin = true;
+        if (stageRaw || statusRaw) provided.stage = true;
+        if (valueRaw !== '' && valueRaw !== null && valueRaw !== undefined) provided.value = true;
+        if (nextStepRaw || nextStepDate) provided.nextStep = true;
+        if (tags !== '' && tags !== null && tags !== undefined) provided.tags = true;
+        if (obsWithExtras) provided.obs = true;
+        if (lossReason !== '' && lossReason !== null && lossReason !== undefined) provided.lossReason = true;
+        if (createdAt !== '' && createdAt !== null && createdAt !== undefined) provided.createdAt = true;
+        if (updatedAt !== '' && updatedAt !== null && updatedAt !== undefined) provided.updatedAt = true;
 
         const raw = {
             id: id !== '' ? id : undefined,
@@ -467,19 +622,23 @@ async function importDataXlsx(file) {
             phone,
             origin,
             stage,
-            value,
+            value: valueRaw,
             nextStep,
             tags,
-            obs: obsWithEmail,
+            obs: obsWithExtras,
             lossReason,
             owner,
             createdAt,
             updatedAt,
-            tasks: []
+            tasks: [],
+            __importMeta: { provided }
         };
 
         const key = raw.id !== undefined && raw.id !== null ? String(raw.id).trim() : '';
-        if (key && tasksByLeadId.has(key)) raw.tasks = tasksByLeadId.get(key);
+        if (key && tasksByLeadId.has(key)) {
+            raw.tasks = tasksByLeadId.get(key);
+            raw.__importMeta.provided.tasks = true;
+        }
         rawLeads.push(raw);
     }
 
@@ -510,18 +669,18 @@ async function importDataXlsx(file) {
     if (mergeMode) {
         const preview = mergeLeadsAdditive(existing, res.leads);
         nextLeads = preview.merged;
-        prompt += `\n\nModo: MESCLAR (nÃ£o apaga).`;
-        prompt += `\nNovos: ${preview.added} â€¢ JÃ¡ existentes: ${preview.skipped} â€¢ Total apÃ³s: ${nextLeads.length}`;
+        prompt += `\n\nModo: MESCLAR (não apaga).`;
+        prompt += `\nNovos: ${preview.added} | Atualizados: ${preview.updated} | Total após: ${nextLeads.length}`;
     } else {
         prompt += `\n\nModo: SUBSTITUIR (apaga os atuais).`;
-        prompt += `\nLeads atuais: ${Array.isArray(existing) ? existing.length : 0} â€¢ Total apÃ³s: ${nextLeads.length}`;
+        prompt += `\nLeads atuais: ${Array.isArray(existing) ? existing.length : 0} | Total após: ${nextLeads.length}`;
     }
 
     const ok = confirm(prompt);
     if (!ok) return;
 
     maybeCreateBackupFromPersisted({ force: true });
-    leads = nextLeads;
+    leads = stripImportMetaFromLeads(nextLeads);
 
     if (backendOnline) {
         try {
@@ -534,40 +693,182 @@ async function importDataXlsx(file) {
 
     cacheLeads(leads);
     renderApp();
-    alert('ImportaÃ§Ã£o concluÃ­da.');
+    alert('Importação concluída.');
+}
+function stripImportMetaFromLead(lead) {
+    if (!lead || typeof lead !== 'object') return lead;
+    const { __importMeta, ...rest } = lead;
+    return rest;
+}
+
+function stripImportMetaFromLeads(list) {
+    return (Array.isArray(list) ? list : [])
+        .filter((l) => l && typeof l === 'object')
+        .map((l) => stripImportMetaFromLead(l));
+}
+
+function normalizePhoneDigits(value) {
+    return String(value ?? '').replace(/\D/g, '');
+}
+
+function phonesAreSimilar(a, b) {
+    const pa = normalizePhoneDigits(a);
+    const pb = normalizePhoneDigits(b);
+    if (!pa || !pb) return false;
+    if (pa === pb) return true;
+    if (Math.min(pa.length, pb.length) < 8) return false;
+    return pa.endsWith(pb) || pb.endsWith(pa);
+}
+
+function hasProvidedImportField(lead, field) {
+    const provided = lead && lead.__importMeta && typeof lead.__importMeta.provided === 'object'
+        ? lead.__importMeta.provided
+        : null;
+    return !!(provided && provided[field]);
+}
+
+function hasImportMetadata(lead) {
+    return !!(lead && lead.__importMeta && typeof lead.__importMeta.provided === 'object');
+}
+
+function normalizedName(value) {
+    return normalizeComparableText(value).replace(/\s+/g, ' ').trim();
+}
+
+function normalizedOwnerOrOrigin(value) {
+    return normalizeComparableText(value).replace(/\s+/g, ' ').trim();
+}
+
+function matchSupportScore(baseLead, incomingLead) {
+    const baseOwner = normalizedOwnerOrOrigin(baseLead && baseLead.owner ? baseLead.owner : '');
+    const incomingOwner = normalizedOwnerOrOrigin(incomingLead && incomingLead.owner ? incomingLead.owner : '');
+    const baseOrigin = normalizedOwnerOrOrigin(baseLead && baseLead.origin ? baseLead.origin : '');
+    const incomingOrigin = normalizedOwnerOrOrigin(incomingLead && incomingLead.origin ? incomingLead.origin : '');
+
+    let score = 0;
+    if (baseOwner && incomingOwner && baseOwner === incomingOwner) score += 2;
+    if (baseOrigin && incomingOrigin && baseOrigin === incomingOrigin) score += 1;
+    return score;
+}
+
+function findBestPhoneMatchIndex(list, incomingLead) {
+    const incomingPhone = normalizePhoneDigits(incomingLead && incomingLead.phone ? incomingLead.phone : '');
+    if (!incomingPhone) return -1;
+
+    let bestIdx = -1;
+    let bestScore = -1;
+    for (let i = 0; i < list.length; i++) {
+        const current = list[i];
+        if (!phonesAreSimilar(current && current.phone ? current.phone : '', incomingPhone)) continue;
+
+        const currentPhone = normalizePhoneDigits(current && current.phone ? current.phone : '');
+        const exactPhone = currentPhone && incomingPhone && currentPhone === incomingPhone ? 1 : 0;
+        const sameName = normalizedName(current && current.name ? current.name : '') === normalizedName(incomingLead && incomingLead.name ? incomingLead.name : '') ? 1 : 0;
+        const support = matchSupportScore(current, incomingLead);
+        const score = (exactPhone * 100) + (sameName * 10) + support;
+
+        if (score > bestScore) {
+            bestScore = score;
+            bestIdx = i;
+        }
+    }
+    return bestIdx;
+}
+
+function findBestNameMatchIndex(list, incomingLead) {
+    const incomingName = normalizedName(incomingLead && incomingLead.name ? incomingLead.name : '');
+    if (!incomingName) return -1;
+
+    let bestIdx = -1;
+    let bestScore = -1;
+    for (let i = 0; i < list.length; i++) {
+        const current = list[i];
+        const currentName = normalizedName(current && current.name ? current.name : '');
+        if (!currentName || currentName !== incomingName) continue;
+
+        const support = matchSupportScore(current, incomingLead);
+        if (support > bestScore) {
+            bestScore = support;
+            bestIdx = i;
+        }
+    }
+    return bestIdx;
+}
+
+function pickIncomingOrExisting(field, existingLead, incomingLead) {
+    if (!hasImportMetadata(incomingLead)) return incomingLead[field];
+    return hasProvidedImportField(incomingLead, field) ? incomingLead[field] : existingLead[field];
+}
+
+function mergeMatchedLead(existingLead, incomingLead) {
+    const current = existingLead && typeof existingLead === 'object' ? existingLead : {};
+    const incoming = incomingLead && typeof incomingLead === 'object' ? incomingLead : {};
+
+    const merged = {
+        ...current,
+        name: pickIncomingOrExisting('name', current, incoming),
+        phone: pickIncomingOrExisting('phone', current, incoming),
+        origin: pickIncomingOrExisting('origin', current, incoming),
+        value: pickIncomingOrExisting('value', current, incoming),
+        nextStep: pickIncomingOrExisting('nextStep', current, incoming),
+        stage: pickIncomingOrExisting('stage', current, incoming),
+        lossReason: pickIncomingOrExisting('lossReason', current, incoming),
+        obs: pickIncomingOrExisting('obs', current, incoming),
+        owner: pickIncomingOrExisting('owner', current, incoming),
+        tags: pickIncomingOrExisting('tags', current, incoming),
+        tasks: pickIncomingOrExisting('tasks', current, incoming),
+        createdAt: pickIncomingOrExisting('createdAt', current, incoming),
+        updatedAt: Date.now()
+    };
+
+    merged.id = current.id;
+    if (!STAGES.includes(merged.stage)) merged.stage = current.stage || 'Novo lead';
+    if (merged.stage !== 'Perdido') merged.lossReason = '';
+
+    const normalized = normalizeImportedLeads([stripImportMetaFromLead(merged)]);
+    if (normalized.ok && Array.isArray(normalized.leads) && normalized.leads[0]) {
+        normalized.leads[0].id = current.id;
+        normalized.leads[0].updatedAt = Date.now();
+        return normalized.leads[0];
+    }
+    return stripImportMetaFromLead(merged);
 }
 
 function mergeLeadsAdditive(existingLeads, importedLeads) {
-    const base = Array.isArray(existingLeads) ? existingLeads : [];
+    const base = stripImportMetaFromLeads(existingLeads);
     const incoming = Array.isArray(importedLeads) ? importedLeads : [];
-
-    const byId = new Map();
-    const merged = [];
-
-    for (const lead of base) {
-        if (!lead || typeof lead !== 'object') continue;
-        const id = lead.id ? String(lead.id) : '';
-        if (!id || byId.has(id)) continue;
-        byId.set(id, lead);
-        merged.push(lead);
-    }
+    const merged = Array.isArray(base) ? [...base] : [];
 
     let added = 0;
-    let skipped = 0;
+    let updated = 0;
+
     for (const lead of incoming) {
         if (!lead || typeof lead !== 'object') continue;
-        const id = lead.id ? String(lead.id) : '';
-        if (!id) continue;
-        if (byId.has(id)) {
-            skipped++;
+
+        const incomingId = sanitizeString(lead.id, 200);
+        let matchIdx = -1;
+
+        if (incomingId) {
+            matchIdx = merged.findIndex((l) => sanitizeString(l && l.id ? l.id : '', 200) === incomingId);
+        }
+        if (matchIdx < 0) {
+            matchIdx = findBestPhoneMatchIndex(merged, lead);
+        }
+        if (matchIdx < 0) {
+            matchIdx = findBestNameMatchIndex(merged, lead);
+        }
+
+        if (matchIdx >= 0) {
+            merged[matchIdx] = mergeMatchedLead(merged[matchIdx], lead);
+            updated++;
             continue;
         }
-        byId.set(id, lead);
-        merged.push(lead);
+
+        merged.push(stripImportMetaFromLead(lead));
         added++;
     }
 
-    return { merged, added, skipped };
+    return { merged: stripImportMetaFromLeads(merged), added, updated };
 }
 
 async function importDataJson(file) {
@@ -612,18 +913,18 @@ async function importDataJson(file) {
     if (mergeMode) {
         const preview = mergeLeadsAdditive(existing, res.leads);
         nextLeads = preview.merged;
-        prompt += `\n\nModo: MESCLAR (nÃ£o apaga).`;
-        prompt += `\nNovos: ${preview.added} â€¢ JÃ¡ existentes: ${preview.skipped} â€¢ Total apÃ³s: ${nextLeads.length}`;
+        prompt += `\n\nModo: MESCLAR (não apaga).`;
+        prompt += `\nNovos: ${preview.added} | Atualizados: ${preview.updated} | Total após: ${nextLeads.length}`;
     } else {
         prompt += `\n\nModo: SUBSTITUIR (apaga os atuais).`;
-        prompt += `\nLeads atuais: ${Array.isArray(existing) ? existing.length : 0} â€¢ Total apÃ³s: ${nextLeads.length}`;
+        prompt += `\nLeads atuais: ${Array.isArray(existing) ? existing.length : 0} | Total após: ${nextLeads.length}`;
     }
 
     const ok = confirm(prompt);
     if (!ok) return;
 
     maybeCreateBackupFromPersisted({ force: true });
-    leads = nextLeads;
+    leads = stripImportMetaFromLeads(nextLeads);
 
     if (backendOnline) {
         try {
@@ -974,43 +1275,196 @@ function setDashboardOwnerFilter(value) {
 }
 
 // --- KANBAN ---
+function ensureKanbanState() {
+    if (kanbanActiveTab !== KANBAN_GENERAL_TAB && !KANBAN_STAGE_TABS.includes(kanbanActiveTab)) {
+        kanbanActiveTab = KANBAN_GENERAL_TAB;
+    }
+    if (!kanbanVisibleByStage || typeof kanbanVisibleByStage !== 'object') {
+        kanbanVisibleByStage = {};
+    }
+    for (const stage of STAGES) {
+        const current = Number(kanbanVisibleByStage[stage]);
+        if (!Number.isFinite(current) || current <= 0) {
+            kanbanVisibleByStage[stage] = KANBAN_INITIAL_VISIBLE;
+        }
+    }
+}
+
+function getKanbanVisibleCount(stage) {
+    ensureKanbanState();
+    return Number(kanbanVisibleByStage[stage]) || KANBAN_INITIAL_VISIBLE;
+}
+
+function setKanbanVisibleCount(stage, nextCount) {
+    ensureKanbanState();
+    const safe = Math.max(KANBAN_INITIAL_VISIBLE, Number(nextCount) || KANBAN_INITIAL_VISIBLE);
+    kanbanVisibleByStage[stage] = safe;
+}
+
+function createLeadCard(lead, stage) {
+    const card = document.createElement('div');
+    card.className = `lead-card ${stage === 'Fechado' ? 'won' : stage === 'Perdido' ? 'lost' : ''} ${canWrite() ? '' : 'readonly'}`;
+    if (canWrite()) card.onclick = () => openEditModal(lead.id);
+    card.innerHTML = `
+        <div class="tag">${lead.origin}</div>
+        <div class="name">${lead.name}</div>
+        <div class="created">📅 ${formatDateOnly(lead.createdAt ?? lead.id)}</div>
+        ${lead.phone ? `<div class="phone">📱 ${lead.phone}</div>` : ''}
+        <div class="val">R$ ${Number(lead.value).toLocaleString()}</div>
+        <div class="next">👣 ${lead.nextStep || 'Sem passo definido'}</div>
+        ${(Array.isArray(lead.tags) && lead.tags.length)
+            ? `<div class="chips">${lead.tags.slice(0, 6).map((t) => `<span class="chip">${t}</span>`).join('')}</div>`
+            : ''
+        }
+        ${lead.owner ? `<div class="consultor-badge">${lead.owner}</div>` : ''}
+    `;
+    return card;
+}
+
+function appendKanbanShowButtons(parent, stage, total, shown) {
+    if (total <= shown) return;
+    const controls = document.createElement('div');
+    controls.className = 'kanban-show-controls';
+
+    const btnMore = document.createElement('button');
+    btnMore.type = 'button';
+    btnMore.className = 'btn-secondary btn-small';
+    btnMore.textContent = 'Mostrar mais';
+    btnMore.onclick = () => {
+        setKanbanVisibleCount(stage, shown + KANBAN_VISIBLE_STEP);
+        renderApp();
+    };
+
+    const btnAll = document.createElement('button');
+    btnAll.type = 'button';
+    btnAll.className = 'btn-secondary btn-small';
+    btnAll.textContent = 'Mostrar tudo';
+    btnAll.onclick = () => {
+        setKanbanVisibleCount(stage, total);
+        renderApp();
+    };
+
+    controls.appendChild(btnMore);
+    controls.appendChild(btnAll);
+    parent.appendChild(controls);
+}
+
+function appendKanbanGeneralShowButtons(parent, stageMeta) {
+    const rows = Array.isArray(stageMeta) ? stageMeta : [];
+    if (!rows.some((r) => Number(r.total) > Number(r.shown))) return;
+
+    const controls = document.createElement('div');
+    controls.className = 'kanban-show-controls';
+
+    const btnMore = document.createElement('button');
+    btnMore.type = 'button';
+    btnMore.className = 'btn-secondary btn-small';
+    btnMore.textContent = 'Mostrar mais';
+    btnMore.onclick = () => {
+        for (const row of rows) {
+            if (!row || !row.stage) continue;
+            if (Number(row.total) <= Number(row.shown)) continue;
+            const next = Math.min(Number(row.total), Number(row.shown) + KANBAN_VISIBLE_STEP);
+            setKanbanVisibleCount(row.stage, next);
+        }
+        renderApp();
+    };
+
+    const btnAll = document.createElement('button');
+    btnAll.type = 'button';
+    btnAll.className = 'btn-secondary btn-small';
+    btnAll.textContent = 'Mostrar tudo';
+    btnAll.onclick = () => {
+        for (const row of rows) {
+            if (!row || !row.stage) continue;
+            setKanbanVisibleCount(row.stage, Number(row.total));
+        }
+        renderApp();
+    };
+
+    controls.appendChild(btnMore);
+    controls.appendChild(btnAll);
+    parent.appendChild(controls);
+}
+
 function renderKanban(container) {
-    const board = document.createElement('div');
-    board.className = 'kanban-board';
-    const visible = getVisibleLeads();
+    ensureKanbanState();
+    const root = document.createElement('div');
+    root.className = 'kanban-root';
 
-    STAGES.forEach(stage => {
-        const col = document.createElement('div');
-        col.className = 'kanban-col';
-        const filtered = visible.filter(l => l.stage === stage && leadMatchesFilter(l));
+    const visible = getVisibleLeads().filter((l) => leadMatchesFilter(l));
+    const counts = {};
+    for (const stage of STAGES) counts[stage] = visible.filter((l) => l.stage === stage).length;
 
-        col.innerHTML = `<div class="col-header">${stage} <span>${filtered.length}</span></div>`;
-        const list = document.createElement('div');
-        list.className = 'card-list';
+    const tabs = document.createElement('div');
+    tabs.className = 'kanban-tabs';
+    const tabItems = [{ key: KANBAN_GENERAL_TAB, label: 'Geral', count: visible.length }].concat(
+        KANBAN_STAGE_TABS.map((stage) => ({ key: stage, label: stage, count: counts[stage] || 0 }))
+    );
+    for (const tab of tabItems) {
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = `kanban-tab-btn ${kanbanActiveTab === tab.key ? 'active' : ''}`;
+        btn.textContent = `${tab.label} (${tab.count})`;
+        btn.onclick = () => {
+            kanbanActiveTab = tab.key;
+            renderApp();
+        };
+        tabs.appendChild(btn);
+    }
+    root.appendChild(tabs);
 
-        filtered.forEach(lead => {
-            const card = document.createElement('div');
-            card.className = `lead-card ${stage === 'Fechado' ? 'won' : stage === 'Perdido' ? 'lost' : ''} ${canWrite() ? '' : 'readonly'}`;
-            if (canWrite()) card.onclick = () => openEditModal(lead.id);
-            card.innerHTML = `
-                <div class="tag">${lead.origin}</div>
-                <div class="name">${lead.name}</div>
-                <div class="created">📅 ${formatDateOnly(lead.createdAt ?? lead.id)}</div>
-                ${lead.phone ? `<div class="phone">📱 ${lead.phone}</div>` : ''}
-                <div class="val">R$ ${Number(lead.value).toLocaleString()}</div>
-                <div class="next">👣 ${lead.nextStep || 'Sem passo definido'}</div>
-                ${(Array.isArray(lead.tags) && lead.tags.length)
-                    ? `<div class="chips">${lead.tags.slice(0, 6).map(t => `<span class="chip">${t}</span>`).join('')}</div>`
-                    : ''
-                }
-                ${lead.owner ? `<div class="consultor-badge">${lead.owner}</div>` : ''}
-            `;
-            list.appendChild(card);
-        });
-        col.appendChild(list);
-        board.appendChild(col);
-    });
-    container.appendChild(board);
+    if (kanbanActiveTab === KANBAN_GENERAL_TAB) {
+        const board = document.createElement('div');
+        board.className = 'kanban-board';
+        const stageMeta = [];
+
+        for (const stage of STAGES) {
+            const stageLeads = visible.filter((l) => l.stage === stage);
+            const visibleCount = getKanbanVisibleCount(stage);
+            const shown = stageLeads.slice(0, visibleCount);
+
+            const col = document.createElement('div');
+            col.className = 'kanban-col';
+            col.innerHTML = `<div class="col-header">${stage} <span>${counts[stage]}</span></div>`;
+
+            const list = document.createElement('div');
+            list.className = 'card-list';
+            for (const lead of shown) list.appendChild(createLeadCard(lead, stage));
+            col.appendChild(list);
+            board.appendChild(col);
+            stageMeta.push({ stage, total: stageLeads.length, shown: shown.length });
+        }
+        root.appendChild(board);
+        appendKanbanGeneralShowButtons(root, stageMeta);
+        container.appendChild(root);
+        return;
+    }
+
+    const stage = kanbanActiveTab;
+    const stageLeads = visible.filter((l) => l.stage === stage);
+    const visibleCount = getKanbanVisibleCount(stage);
+    const shown = stageLeads.slice(0, visibleCount);
+
+    const stageView = document.createElement('div');
+    stageView.className = 'kanban-stage-view';
+    stageView.innerHTML = `<div class="col-header">${stage} <span>${stageLeads.length}</span></div>`;
+
+    const grid = document.createElement('div');
+    grid.className = 'kanban-stage-grid';
+    for (const lead of shown) grid.appendChild(createLeadCard(lead, stage));
+    stageView.appendChild(grid);
+
+    if (shown.length === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'kanban-empty';
+        empty.textContent = 'Nenhum lead encontrado para esta etapa.';
+        stageView.appendChild(empty);
+    }
+
+    appendKanbanShowButtons(stageView, stage, stageLeads.length, shown.length);
+    root.appendChild(stageView);
+    container.appendChild(root);
 }
 
 // --- DASHBOARD (cards + tabelas + gráfico com tipo selecionável) ---
@@ -1143,6 +1597,7 @@ function initSalesChart(type = 'bar', inputLeads = leads) {
                 label: 'Valor Total (R$)',
                 data: dataByStage,
                 backgroundColor: [
+                    'rgba(6, 182, 212, 0.6)',  // Leads do site
                     'rgba(37, 99, 235, 0.6)',  // Novo lead
                     'rgba(59, 130, 246, 0.6)', // Qualificação
                     'rgba(96, 165, 250, 0.6)', // Simulação
@@ -1367,7 +1822,7 @@ function buildOwnerOptionsHtml(selectedOwner, usernames) {
     const finalList = selected && !unique.includes(selected) ? [selected, ...unique] : unique;
 
     return [
-        `<option value="" ${selected ? '' : 'selected'}>â€”</option>`,
+        `<option value="" ${selected ? '' : 'selected'}>&mdash;</option>`,
         ...finalList.map((u) => `<option value="${u}" ${u === selected ? 'selected' : ''}>${u}</option>`)
     ].join('');
 }
@@ -1471,8 +1926,13 @@ function openEditModal(id) {
                     </div>
                     <div class="tk-list">
                         ${tasks.map((t, i) => `
-                            <div class="tk-item ${t.done ? 'done' : ''}">
-                                <span onclick='toggleTask(${leadId}, ${i})'>${t.done ? '✅' : '⭕'} ${t.desc}</span>
+                            <div class="tk-item ${t.done ? 'done' : ''}" onclick='toggleTask(${leadId}, ${i})'>
+                                <div class="tk-item-row">
+                                    <span>${t.done ? '✅' : '⭕'} Tarefa ${i + 1} • ${coerceEpochMs(t && t.createdAt) ? formatDateOnly(t.createdAt) : 'sem data'} — ${t.desc}</span>
+                                    <button type="button" class="tk-del" title="Excluir tarefa" onclick='event.stopPropagation(); deleteTask(${leadId}, ${i})'>
+                                        <i class="ph ph-trash"></i>
+                                    </button>
+                                </div>
                             </div>
                         `).join('')}
                     </div>
@@ -1562,8 +2022,11 @@ async function addTask(id) {
     const lead = leads.find(l => l.id === id);
     if (!lead) return;
     if (!Array.isArray(lead.tasks)) lead.tasks = [];
-    lead.tasks.push({ desc, done: false });
-    lead.updatedAt = Date.now();
+    const now = Date.now();
+    lead.tasks.push({ desc, done: false, createdAt: now });
+    lead.updatedAt = now;
+    const input = document.getElementById('tk-new');
+    if (input) input.value = '';
 
     if (backendOnline) {
         try {
@@ -1600,6 +2063,34 @@ async function toggleTask(id, idx) {
     openEditModal(id);
 }
 
+async function deleteTask(id, idx) {
+    if (!canWrite()) return;
+    const lead = leads.find(l => l.id === id);
+    if (!lead || !Array.isArray(lead.tasks) || !lead.tasks[idx]) return;
+
+    const ok = confirm('Excluir esta tarefa?');
+    if (!ok) return;
+
+    // Destrutivo: cria backup do estado atual mesmo com backup automático desligado
+    maybeCreateBackupFromPersisted({ force: true });
+
+    lead.tasks.splice(idx, 1);
+    lead.updatedAt = Date.now();
+
+    if (backendOnline) {
+        try {
+            const saved = await apiUpdateLead(lead.id, lead);
+            const leadIdx = leads.findIndex(l => l.id === id);
+            if (leadIdx >= 0) leads[leadIdx] = saved;
+        } catch (e) {
+            if (handleApiFailure(e, 'Não foi possível salvar tarefas no servidor.')) return;
+        }
+    }
+
+    save();
+    openEditModal(id);
+}
+
 function save() {
     maybeCreateBackupFromPersisted();
     localStorage.setItem(CRM_DATA_KEY, JSON.stringify(leads));
@@ -1607,3 +2098,4 @@ function save() {
 }
 
 init();
+
